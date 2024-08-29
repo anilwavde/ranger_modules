@@ -1,6 +1,7 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
+#
 # This software is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
@@ -14,25 +15,24 @@
 # You should have received a copy of the GNU General Public License
 # along with this software. If not, see <http://www.gnu.org/licenses/>.
 
+
 DOCUMENTATION = '''
 ---
-module: ranger_kafka_policies
-short_description: Manage definition of Kafka Policy in Apache Ranger
+module: ranger_spark_policies
+short_description: Manage definition of Spark Policy in Apache Ranger
 description:
-     - This module will allow you to manage Kafka policy in Apache Ranger.
+     - This module will allow you to manage Spark policy in Apache Ranger.
      - Please refer to Apache Ranger documentation for authorization policy concept and usage.
 options:
   admin_url:
     description:
-      - The Ranger base URL to access Ranger API. Same host:port as the Ranger Admin GUI. Typically http://myranger.server.com:6080 or https://myranger.server.com:6182
+      - The Ranger base URL to access Ranger API. Same host:port as the Ranger Admin GUI. https://myranger.server.com:6182
     required: true
     default: None
     aliases: []
   admin_username:
     description:
       - The user name to log on the Ranger Admin. Must have enough rights to manage policies.
-      - Also accepts the special value C(KERBEROS). In such case, a valid Kerberos ticket must exist for the ansible_user account on the target system. (A C(kinit) must be issued under this account).
-        Then HDFS operation will be performed on behalf of the user defined by the Kerberos ticket.
     required: true
     default: None
     aliases: []
@@ -42,9 +42,9 @@ options:
     required: true
     default: None
     aliases: []
-  validate_certs:
+  ssl_verify:
     description:
-      - Useful if Ranger Admin connection is using SSL. If no, SSL certificates will not be validated. This should only be used on personally controlled sites using self-signed certificates.
+      - Useful if Ranger Admin connection is using SSL. If no, SSL certificates will not be validated. This should only be used on sites using self-signed certificates.
     required: false
     default: True
     aliases: []
@@ -58,7 +58,7 @@ options:
     aliases: []
   service_name:
     description:
-      - In most cases, you should not need to set this parameter. It define the Ranger Admin Kafka service, typically <yourClusterName>_kafka.
+      - In most cases, you should not need to set this parameter. It define the Ranger Admin Spark service, typically <yourClusterName>_spark.
       - It must be set if there are several such services defined in your Ranger Admin configuration, to select the one you intend to use.
     required: false
     default: None
@@ -81,9 +81,21 @@ options:
     required: true
     default: None
     aliases: []
-  policies[0..n].topic:
+  policies[0..n].[database | url | sparkservice | global ]:
     description:
-      - A list of Kafka topic this policy will apply on. Accept wildcard characters '*' and '?'
+      - A list of database names, url, sparkservice or global. Accept wildcard characters '*' and '?'
+    required: true
+    default: None
+    aliases: []
+  policies[0..n].[table|udf]:
+    description:
+      - When database resource is defined. A list of tables or udf. Accept wildcard character '*'
+    required: true
+    default: None
+    aliases: []
+  policies[0..n].column:
+    description:
+      - When database and tables are defined. A list of columns. Accept wildcard character '*'
     required: true
     default: None
     aliases: []
@@ -137,7 +149,6 @@ options:
     aliases: []
 
 author:
-    - "Serge ALEXANDRE"
     - "Anil Wavde"
 
 '''
@@ -145,51 +156,48 @@ author:
 
 EXAMPLES = '''
 
-# Allow user 'app1' to publish to Kafka topic 'topic1'. And allow user 'app2' and all users belonging to groups 'grp1 and grp2 to consume.
+# Allow user 'app1' to create,update,drop database 'database1'. And allow user 'app2' and all users belonging to groups 'grp1 and grp2 to select.
 
-- hosts: edge_node1
-  roles:
-  - ranger_modules
+- hosts: ambari_nodes
   tasks:
-  - ranger_kafka_policies:
+  - ranger_spark_policies:
       state: present
       admin_url: https://ranger.mycompany.com:6182
       admin_username: admin
       admin_password: admin
-      validate_certs: no
+      ssl_verify: False
       policies:
-      - name: "kpolicy1"
-        topic:
-        - "topic1"
+      - name: "spark_policy1"
+        database:
+            - "my_ranger_schema"
+        table:
+            - *
+        column:
+            - *
         permissions:
         - users:
           - app1
-          accesses:
-          - Publish
+          accesses: [create, update] # all, alter, create, drop, index, lock, read, refresh, repladmin, select, serviceadmin, tempudfadmin, update, write
         - users:
           - app2
           groups:
           - grp1
           - grp2
           accesses:
-          - consume
-
-
+          - select
 
 # Same result, expressed in a different way
 - hosts: en1
   vars:
     policy1:
-      { name: kpolicy1, topic: [ topic1 ], permissions: [ { users: [ app1 ], accesses: [ publish ] }, { users: [ app2 ], groups: [ grp1, grp2 ], accesses: [ consume ] } ] }
-  roles:
-  - ranger_modules
+      { name: spark_policy1, database: [ my_ranger_schema ], table: [*], column: [*], permissions: [ { users: [ app1 ], accesses: [ create,update,drop ] }, { users: [ app2 ], groups: [ grp1, grp2 ], accesses: [ select ] } ] }
   tasks:
-  - ranger_kafka_policies:
+  - ranger_spark_policies:
       state: present
-      admin_url: https://nn1.hdp13.bsa.broadsoftware.com:6182
+      admin_url: https://ranger.mycompany.com:6182
       admin_username: admin
       admin_password: admin
-      validate_certs: no
+      ssl_verify: False
       policies:
       - "{{ policy1 }}"
 
@@ -199,8 +207,8 @@ EXAMPLES = '''
 import warnings
 from oci._vendor import requests
 from oci._vendor.requests.auth import HTTPBasicAuth
+from ansible.module_utils.basic import AnsibleModule
 
-# Global, to allow access from error
 module = None
 resourceType = None
 allowedResourceType = None
@@ -221,22 +229,19 @@ def info(message):
 
 class RangerAPI:
 
-    def __init__(self, endpoint, username, password, verify):
+    def __init__(self, endpoint, username, password, ssl_verify):
         self.endpoint = endpoint
         self.username = username
         self.password = password
-        self.verify = verify
+        self.ssl_verify = ssl_verify
         self.serviceNamesByType = None
-        if self.username == "KERBEROS":
-            self.auth = HTTPKerberosAuth()
-        else:
-            self.auth = HTTPBasicAuth(self.username, self.password)
-            warnings.filterwarnings("ignore", ".*Unverified HTTPS.*")
-            warnings.filterwarnings("ignore", ".*Certificate has no `subjectAltName`.*")
+        self.auth = HTTPBasicAuth(self.username, self.password)
+        warnings.filterwarnings("ignore", ".*Unverified HTTPS.*")
+        warnings.filterwarnings("ignore", ".*Certificate has no `subjectAltName`.*")
 
     def get(self, path):
         url = self.endpoint + "/" + path
-        resp = requests.get(url, auth = self.auth, verify=self.verify)
+        resp = requests.get(url, auth = self.auth, verify=self.ssl_verify)
         debug("HTTP GET({})  --> {}".format(url, resp.status_code))
         if resp.status_code == 200:     # Warning: Failing auth may trigger a 200 with an HTML login page.
             contentType = resp.headers["content-type"] if ("content-type" in resp.headers) else "unknown"
@@ -248,8 +253,6 @@ class RangerAPI:
                 error("HTML content received. May be Ranger login or password is invalid!")
             else:
                 error("Invalid 'content-type' ({}) in response".format(contentType))
-        elif resp.status_code == 401 and self.username == "KERBEROS":
-            error("KERBEROS authentication failed! (Did you perform kinit ?)")
         else:
             error("Invalid returned http code '{0}' when calling GET on '{1}'".format(resp.status_code, url))
 
@@ -261,7 +264,7 @@ class RangerAPI:
                 if not service["type"] in self.serviceNamesByType:
                     self.serviceNamesByType[service['type']] = []
                 self.serviceNamesByType[service['type']].append(service['name'])
-            #logger.debug(self.serviceNamesByType)
+
         if stype not in self.serviceNamesByType:
             error("Service type '{0}' is not defined in this Ranger instance".format(stype) )
         serviceNames = self.serviceNamesByType[stype]
@@ -279,21 +282,21 @@ class RangerAPI:
 
     def createPolicy(self, policy):
         url = self.endpoint + '/service/public/v2/api/policy'
-        resp = requests.post(url, auth = self.auth, json=policy, headers={'content-type': 'application/json'}, verify=self.verify)
+        resp = requests.post(url, auth = self.auth, json=policy, headers={'content-type': 'application/json'}, verify=self.ssl_verify)
         debug("HTTP POST({})  --> {}".format(url, resp.status_code))
         if resp.status_code != 200:
             error("Invalid returned http code '{0}' when calling POST on '{1}': {2}".format(resp.status_code, url, resp.text))
 
     def deletePolicy(self, pid):
         url = "{0}/service/public/v2/api/policy/{1}".format(self.endpoint, pid)
-        resp = requests.delete(url, auth = self.auth, verify=self.verify)
+        resp = requests.delete(url, auth = self.auth, verify=self.ssl_verify)
         debug("HTTP DELETE({})  --> {}".format(url, resp.status_code))
         if resp.status_code < 200 or resp.status_code > 299:
             error("Invalid returned http code '{0}' when calling DELETE on '{1}: {2}'".format(resp.status_code, url, resp.text))
 
     def updatePolicy(self, policy):
         url = "{0}/service/public/v2/api/policy/{1}".format(self.endpoint, policy["id"])
-        resp = requests.put(url, auth = self.auth, json=policy, headers={'content-type': 'application/json'}, verify=self.verify)
+        resp = requests.put(url, auth = self.auth, json=policy, headers={'content-type': 'application/json'}, verify=self.ssl_verify)
         debug("HTTP PUT({})  --> {}".format(url, resp.status_code))
         if resp.status_code != 200:
             error("Invalid returned http code '{0}' when calling PUT on '{1}': {2}".format(resp.status_code, url, resp.text))
@@ -302,7 +305,6 @@ class RangerAPI:
         pass
 
 # ---------------------------------------------------------------------------------
-
 
 def digdiff(left, right):
     result = {
@@ -316,7 +318,6 @@ def digdiff(left, right):
 
 
 def diffValue(left, right, path, result):
-    #print "diffValue(left:{0}   right:{1})".format(left, right)
     if right == None:
         if left != None:
             result["differsByValue"].append(path)
@@ -336,11 +337,9 @@ def diffValue(left, right, path, result):
             else:
                 result["differsByType"].append(path)
         else:
-            # left is a scalar
             left = normalizeType(left)
             right = normalizeType(right)
             if type(left) != type(right):
-                #print "********************* type(left):{0}   type(right):{1}".format(type(left), type(right))
                 result["differsByType"].append(path)
             else:
                 if left != right:
@@ -349,18 +348,12 @@ def diffValue(left, right, path, result):
                     pass
 
 def normalizeType(value):
-    """
-    Try to normalize o type, to be able to compare them
-    """
-    if isinstance(value, unicode):
-        return str(value)
-    else:
+    if isinstance(value, str):
         return value
-
-
+    else:
+        return str(value)
 
 def diffDict(left, right, path, result):
-    #print "diffDict(left:{0}   right:{1})".format(left, right)
     for kl in left:
         path2 = path + "." + kl
         if kl in right:
@@ -374,7 +367,6 @@ def diffDict(left, right, path, result):
         else:
             result['missingOnLeft'].append(path2)
 
-
 def diffList(left, right, path, result):
     for x in range(len(left)):
         path2 = path + '[' + str(x) + ']'
@@ -386,17 +378,12 @@ def diffList(left, right, path, result):
         path2 = path + '[' + str(x) + ']'
         result['missingOnLeft'].append(path2)
 
-
-
 # ---------------------------------------------------------------------------------
-
 
 ALLOWED_MISSING_ON_RIGHT = set([".version", ".policyType", ".guid"])
 
 def isPolicyIdentical(old, new):
     result = digdiff(old, new)
-    #misc.ppprint(old)
-    #misc.ppprint(new)
     debug("missingOnLeft:{}".format(result['missingOnLeft']))
     debug("missingOnRight:{}".format(result['missingOnRight']))
     debug("differsByType:{}".format(result['differsByType']))
@@ -409,30 +396,26 @@ def isPolicyIdentical(old, new):
                 return False
         return True
 
-
-
-# --------------------------------------------------------- Grooming helper function
-
+# Grooming helper functions
 def checkListOfStrNotEmpty(base, attr, prefix):
     if attr not in base:
         error("{0}: Missing attribute '{1}'".format(prefix, attr))
     if not isinstance(base[attr], list):
-        error("{0}: Attribute '{1}' if of wrong type. Must by a list".format(prefix, attr))
+        error("{0}: Attribute '{1}' is of wrong type. Must be a list".format(prefix, attr))
     if len(base[attr]) == 0:
         error("{0}: Attribute '{1}': Must have at least one items".format(prefix, attr))
     for v in base[attr]:
-        if not isinstance(v, basestring) or len(v) == 0:
+        if not isinstance(v, str) or len(v) == 0:
             error("{0}: All items of list '{1}' must be non null string".format(prefix, attr))
-
 
 def checkListOfStr(base, attr, prefix):
     if attr not in base:
         base[attr] = []
     else:
         if not isinstance(base[attr], list):
-            error("{0}: Attribute '{1}' if of wrong type. Must by a list".format(prefix, attr))
+            error("{0}: Attribute '{1}' is of wrong type. Must be a list".format(prefix, attr))
         for v in base[attr]:
-            if not isinstance(v, basestring) or len(v) == 0:
+            if not isinstance(v, str) or len(v) == 0:
                 error("{0}: All items of list '{1}' must be non null string".format(prefix, attr))
 
 def checkTypeWithDefault(base, attr, typ, default, prefix):
@@ -440,14 +423,14 @@ def checkTypeWithDefault(base, attr, typ, default, prefix):
         base[attr] = default
     else:
         if not isinstance(base[attr], typ):
-            error("{0}: Attribute '{1}' if of wrong type. Must by a {2}".format(prefix, attr, typ))
+            error("{0}: Attribute '{1}' is of wrong type. Must be a {2}".format(prefix, attr, typ))
 
 def checkEnumWithDefault(base, attr, candidates, default, prefix):
     if attr not in base:
         base[attr] = default
     else:
-        if not isinstance(base[attr], basestring):
-            error("{0}: Attribute '{1}' if of wrong type. Must by a string".format(prefix, attr))
+        if not isinstance(base[attr], str):
+            error("{0}: Attribute '{1}' is of wrong type. Must be a string".format(prefix, attr))
         else:
             if not base[attr] in candidates:
                 error("{0}: Attribute '{1}' must be one of the following: {2}".format(prefix, attr, candidates))
@@ -474,57 +457,85 @@ def checkResourceType(base, allowedResourceType, prefix):
     resourceType = providedResourceType[0] if providedResourceType else None
     return resourceType
 
+def checkDatabaseResource(base, validAttrSet, prefix):
+    providedResType = [attr for attr in base if attr in validAttrSet]
+    if len(providedResType) > 1:
+        error("{0}: Only one of {1} can be provided, but found {2}".format(prefix, validAttrSet, providedResType))
+    elif len(providedResType) == 1:
+        checkListOfStrNotEmpty(base, providedResType[0], prefix)
+
+# Sanity-checks for target policy
 def groom(policy):
-    """
-    Check and Normalize target policy expression
-    """
     if 'name' not in policy:
-        error("There is at least one Kafka policy without name!")
-    if not isinstance(policy["name"], basestring):
-        error("Kafka policy: Attribute 'name' if of wrong type. Must by a string")
-    prefix = "Kafka policy '{0}': ".format(policy['name'])
+        error("There is at least one Spark policy without name!")
+    if not isinstance(policy["name"], str):
+        error("Spark policy: Attribute 'name' is of wrong type. Must be a string")
+    prefix = "Spark policy '{0}': ".format(policy['name'])
 
     global allowedResourceType
-    checkValidAttr(policy, ['name','audit', allowedResourceType, 'enabled', 'permissions'], prefix)
+    checkValidAttr(policy, ['name','audit', 'state', allowedResourceType, 'table', 'column', 'udf', 'enabled', 'permissions'], prefix)
 
     resourceType = checkResourceType(policy, allowedResourceType, prefix)
+    debug("resourceType".format(resourceType))
     checkListOfStrNotEmpty(policy, resourceType, prefix)
+
+    if resourceType == 'database':
+        # Policy resource type 'database' can optionally have 'table' or 'udf'
+        checkDatabaseResource(policy,['table', 'udf'],prefix)
+        #  'column' can only be combined with 'table'
+        checkDatabaseResource(policy,['column', 'udf'],prefix)
+        if 'column' in policy and not 'table' in policy:
+                error("{0}: Missing resource 'table' for 'column'".format(prefix))
+
+    else:
+        # { url, sparkservice, global } resource type doesn't have any other resourceType combination
+        if 'table' in policy or 'column' in policy or 'udf' in policy:
+            error("{0}: 'table', 'column', 'udf' can't be combined with '{1}'".format(prefix, resourceType))
+
     checkTypeWithDefault(policy, "audit", bool, True, prefix)
     checkTypeWithDefault(policy, "enabled", bool, True, prefix)
-
     checkTypeWithDefault(policy, "permissions", list, [], prefix)
 
+    # Validate permissions block
     for permission in policy['permissions']:
-        checkValidAttr(permission, ['users', 'groups', 'accesses', 'ip_addresses', 'delegate_admin'], prefix)
+        checkValidAttr(permission, ['users', 'groups', 'accesses', 'delegate_admin'], prefix)
         checkListOfStr(permission, 'users', prefix)
         checkListOfStr(permission, 'groups', prefix)
         checkListOfStr(permission, 'accesses', prefix)
-        checkListOfStr(permission, 'ip_addresses', prefix)
         checkTypeWithDefault(permission, 'delegate_admin', bool, False, prefix)
 
     return resourceType
 
-def newPolicy(tgtPolicy, resourceType, service):
+def generateNewPolicy(targetPolicy, resourceType, service):
     policy = {
         'allowExceptions': [],
         'dataMaskPolicyItems': [],
         'denyExceptions': [],
         'denyPolicyItems': [],
-        'isAuditEnabled': tgtPolicy['audit'],
-        'isEnabled': tgtPolicy['enabled'],
-        'name': tgtPolicy['name'],
+        'isAuditEnabled': targetPolicy['audit'],
+        'isEnabled': targetPolicy['enabled'],
+        'name': targetPolicy['name'],
         'policyItems': [],
         'resources': {
             resourceType: {
                 "isExcludes": False,
                 "isRecursive": False,
-                "values": tgtPolicy[resourceType]
+                "values": targetPolicy[resourceType]
             }
         },
         'rowFilterPolicyItems': [],
         'service': service
     }
-    for p in tgtPolicy['permissions']:
+
+    if 'database' == resourceType:
+        if 'udf' in targetPolicy and len(targetPolicy['udf']) > 0:
+            policy['resources']['udf'] = { "isExcludes": False, "isRecursive": False, "values": targetPolicy["udf"] }
+        if 'table' in targetPolicy and len(targetPolicy['table']) > 0:
+            policy['resources']['table'] = { "isExcludes": False, "isRecursive": False, "values": targetPolicy["table"] }
+        if 'column' in targetPolicy and len(targetPolicy['column']) > 0:
+            policy['resources']['column'] = { "isExcludes": False, "isRecursive": False, "values": targetPolicy["column"]}
+
+    for p in targetPolicy['permissions']:
         tp = {}
         tp['accesses'] = []
         tp['conditions'] = []
@@ -533,8 +544,6 @@ def newPolicy(tgtPolicy, resourceType, service):
         tp['users'] = p['users']
         for a in p['accesses']:
             tp['accesses'].append({ "isAllowed": True, "type": a.lower() })
-        if 'ip_addresses' in p and len(p['ip_addresses']) > 0:
-            tp['conditions'].append({ "type": "ip-range", "values": p['ip_addresses']})
         policy['policyItems'].append(tp)
     return policy
 
@@ -562,7 +571,7 @@ def main():
             admin_url = dict(required=True, type='str'),
             admin_username = dict(required=True, type='str'),
             admin_password = dict(required=True, type='str',no_log=True),
-            validate_certs = dict(required=False, type='bool', default=False),
+            ssl_verify = dict(required=False, type='bool', default=False),
             ca_bundle_file = dict(required=False, type='str'),
             service_name = dict(required=False, type='str'),
             policies = dict(required=True, type='list'),
@@ -576,7 +585,7 @@ def main():
     params.adminUrl = module.params['admin_url']
     params.adminUsername = module.params['admin_username']
     params.adminPassword = module.params['admin_password']
-    params.validateCerts = module.params['validate_certs']
+    params.sslVerify = module.params['ssl_verify']
     params.ca_bundleFile = module.params['ca_bundle_file']
     params.serviceName = module.params['service_name']
     params.policies = module.params['policies']
@@ -586,42 +595,42 @@ def main():
     global logLevel
     global allowedResourceType
     logLevel = params.logLevel
-    allowedResourceType = {'topic', 'cluster', 'delegationtoken', 'consumergroup', 'user', 'transactionalid'}
+    allowedResourceType = {'database', 'url', 'sparkservice', 'global'}
 
     checkParameters(params)
 
     if params.ca_bundleFile != None:
-        verify = params.ca_bundleFile
+        ssl_verify = params.ca_bundleFile
     else:
-        verify = params.validateCerts
+        ssl_verify = params.sslVerify
 
     global rangerAPI
-    rangerAPI =  RangerAPI(params.adminUrl, params.adminUsername , params.adminPassword , verify)
+    rangerAPI =  RangerAPI(params.adminUrl, params.adminUsername , params.adminPassword , ssl_verify)
 
     result = {}
-    kafkaServiceName = rangerAPI.getServiceNameByType("kafka", params.serviceName)
+    sparkServiceName = rangerAPI.getServiceNameByType("spark", params.serviceName)
 
-    for tgtPolicy in params.policies:
+    for targetPolicy in params.policies:
         # Perform check before effective operation
-        resourceType = groom(tgtPolicy)
-        policyName = tgtPolicy['name']
+        resourceType = groom(targetPolicy)
+        policyName = targetPolicy['name']
         result[policyName] = {}
-        oldPolicies = rangerAPI.getPolicy(kafkaServiceName, policyName)
+        oldPolicies = rangerAPI.getPolicy(sparkServiceName, policyName)
         debug("oldPolicies: " + repr(oldPolicies))
 
         if len(oldPolicies) > 1:
-            error("More than one policy with name '{0}' !".format(policyName))
+            error("Multiple policies found with name '{0}' !".format(policyName))
 
         if params.state == 'present':
             if len(oldPolicies) == 0:
-                policy = newPolicy(tgtPolicy, resourceType, kafkaServiceName)
+                policy = generateNewPolicy(targetPolicy, resourceType, sparkServiceName)
                 rangerAPI.createPolicy(policy)
                 result[policyName]['action'] = "created"
                 params.changed = True
             else:
                 oldPolicy = oldPolicies[0]
                 pid = oldPolicy["id"]
-                policy = newPolicy(tgtPolicy, resourceType, kafkaServiceName)
+                policy = generateNewPolicy(targetPolicy, resourceType, sparkServiceName)
                 policy["id"] = pid
                 result[policyName]['id'] = pid
                 if isPolicyIdentical(oldPolicy, policy):
@@ -630,7 +639,6 @@ def main():
                     result[policyName]['action'] = "updated"
                     rangerAPI.updatePolicy(policy)
                     params.changed = True
-                #misc.ppprint(oldPolicy)
         elif params.state == 'absent':
             if len(oldPolicies) == 1:
                 rangerAPI.deletePolicy(oldPolicies[0]["id"])
@@ -645,8 +653,6 @@ def main():
         policies = result,
         logs = logs
     )
-
-from ansible.module_utils.basic import *  #@UnusedWildImport
 
 if __name__ == '__main__':
     main()
